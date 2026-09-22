@@ -17,7 +17,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 
-from .alerts import AlertEngine
+from .alerts import AlertEngine, RuleVersionError
 from .config import Settings
 from .cursor import Cursor, CursorError, decode_cursor, encode_cursor
 from .db import connect, init_db, write_txn
@@ -28,6 +28,8 @@ from .models import (
     AlertRuleIn,
     AlertRuleList,
     AlertRuleOut,
+    AlertRuleUpdateIn,
+    AlertRuleVersionList,
     BatchIn,
     BatchResponse,
     RecordOut,
@@ -66,11 +68,12 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="Device Telemetry Ingest API",
-        version="1.0.0",
+        version="1.1.0",
         description="Local telemetry receiver with per-device sliding-window "
         "ordering, idempotent dedup, gap (断档) detection and replay, "
-        "consecutive-threshold alerting on committed records, and an "
-        "idempotent alert acknowledgement workflow.",
+        "consecutive-threshold alerting on committed records, versioned alert "
+        "rules with per-seq effective-version selection, and an idempotent "
+        "alert acknowledgement workflow.",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -323,6 +326,52 @@ def create_app(settings: Settings) -> FastAPI:
                 device_id, rule.field, rule.op, rule.threshold, rule.consecutive
             )
 
+    @app.put(
+        f"{API_PREFIX}/devices/{{device_id}}/alert-rules/{{rule_id}}",
+        response_model=AlertRuleOut,
+    )
+    def update_alert_rule(
+        device_id: str, rule_id: int, rule: AlertRuleUpdateIn, conn=Depends(get_conn)
+    ):
+        """Modify a rule by appending a new immutable version.
+
+        The version number increments by one; `effective_from_seq` selects the
+        first committed seq governed by the new configuration and defaults to
+        the device's current next_expected. Already-committed records, older
+        versions (with their streak state) and alerts already generated are
+        never rewritten. The effective version for each record is selected
+        atomically by seq inside the batch/drain write transaction.
+        """
+        if not math.isfinite(rule.threshold):
+            raise HTTPException(status_code=422, detail="threshold must be a finite number")
+        with write_txn(conn):
+            try:
+                updated = AlertEngine(conn).update_rule(
+                    device_id, rule_id, rule.field, rule.op, rule.threshold,
+                    rule.consecutive, rule.effective_from_seq,
+                )
+            except RuleVersionError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        if updated is None:
+            raise HTTPException(
+                status_code=404, detail=f"rule {rule_id} not found for {device_id}"
+            )
+        return updated
+
+    @app.get(
+        f"{API_PREFIX}/devices/{{device_id}}/alert-rules/{{rule_id}}/versions",
+        response_model=AlertRuleVersionList,
+    )
+    def list_alert_rule_versions(device_id: str, rule_id: int, conn=Depends(get_conn)):
+        """List every version of a rule (oldest first), each with its own
+        configuration snapshot and evaluation state."""
+        versions = AlertEngine(conn).list_versions(device_id, rule_id)
+        if versions is None:
+            raise HTTPException(
+                status_code=404, detail=f"rule {rule_id} not found for {device_id}"
+            )
+        return AlertRuleVersionList(device_id=device_id, rule_id=rule_id, versions=versions)
+
     @app.get(f"{API_PREFIX}/devices/{{device_id}}/alert-rules", response_model=AlertRuleList)
     def list_alert_rules(device_id: str, conn=Depends(get_conn)):
         return AlertRuleList(
@@ -333,6 +382,10 @@ def create_app(settings: Settings) -> FastAPI:
     def list_alerts(
         device_id: str,
         rule_id: Optional[int] = Query(default=None, ge=1),
+        rule_version: Optional[int] = Query(
+            default=None, ge=1,
+            description="Only alerts produced by this version of the rule.",
+        ),
         status: Optional[str] = Query(
             default=None,
             pattern="^(open|acknowledged)$",
@@ -342,7 +395,9 @@ def create_app(settings: Settings) -> FastAPI:
     ):
         return AlertList(
             device_id=device_id,
-            alerts=AlertEngine(conn).list_alerts(device_id, rule_id, status),
+            alerts=AlertEngine(conn).list_alerts(
+                device_id, rule_id, rule_version, status
+            ),
         )
 
     @app.post(

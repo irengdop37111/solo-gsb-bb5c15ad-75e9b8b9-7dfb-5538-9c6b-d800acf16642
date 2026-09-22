@@ -1,6 +1,6 @@
 # 设备遥测接收 API（device-telemetry-ingest）
 
-基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。另支持**连续阈值告警**：按设备配置规则，对已提交记录按序检测连续越限并生成可查询告警；每条告警携带 `open`/`acknowledged` 状态，可通过**幂等确认接口**由确认人标记为已确认（记录确认人与确认时间，重复确认不改变首次确认信息）。
+基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。另支持**连续阈值告警**：按设备配置规则，对已提交记录按序检测连续越限并生成可查询告警；每条告警携带 `open`/`acknowledged` 状态，可通过**幂等确认接口**由确认人标记为已确认（记录确认人与确认时间，重复确认不改变首次确认信息）。**告警规则版本化**：修改规则不会原地改动旧配置，而是追加一个递增版本并可指定生效序列号（`effective_from_seq`）；每条 committed 记录在写事务内按序列号**原子选择唯一生效版本**评估，历史版本、每版本连续计数状态与已生成告警均永久保留，另提供版本列表与按版本筛选告警接口。
 
 ## 快速启动
 
@@ -27,7 +27,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 服务信息/当前配置 | `http://localhost:8000/` |
 | 端口 | `8000`（Compose 映射 `8000:8000`，可在 `docker-compose.yml` 修改） |
 
-SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过命名卷 `telemetry-data` 持久化。升级到带告警确认工作流的镜像时，启动初始化会自动为旧库的 `alerts` 表补齐 `status`/`acknowledged_by`/`acknowledged_at` 列（历史告警视为 `open`），无需手动迁移；但请仍按惯例在升级前备份卷内数据库。
+SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过命名卷 `telemetry-data` 持久化。升级镜像时启动初始化会自动迁移旧库，无需手动干预（但仍建议升级前备份卷内数据库）：为旧库 `alerts` 表补齐 `status`/`acknowledged_by`/`acknowledged_at` 列（历史告警视为 `open`）；升级到带**规则版本化**的镜像时，会把旧 `alert_rules` 表重建为“规则身份 + 不可变版本”结构，存量规则导入为**版本 1、生效序号 0**，原连续计数状态迁移到版本 1 的独立状态行，历史告警标记为 `rule_version = 1`，自增主键计数也会保留。迁移均为幂等，可重复启动。
 
 ## 配置项（环境变量）
 
@@ -70,6 +70,31 @@ SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过�
 同一连续区段不再重复生成；待计数中断（恢复正常）后，下一段连续越限才会再次触发。
 规则创建前已提交的历史记录不回溯计算。
 
+**告警规则版本化切换**：规则修改不会原地更新配置，而是为该规则追加一条**不可变版本**
+（版本号在规则内从 1 开始单调递增）。每个版本携带 field/op/threshold/consecutive 的完整快照
+和一个**生效序列号** `effective_from_seq`：记录 seq 首次转为 `committed` 时，在同一个
+`BEGIN IMMEDIATE` 写事务内按
+
+```
+SELECT ... FROM alert_rule_versions
+WHERE rule_id = :id AND effective_from_seq <= :seq
+ORDER BY effective_from_seq DESC, version DESC LIMIT 1
+```
+
+**原子选择该 seq 的唯一生效版本**（相同生效序号时版本号更高者胜出，可表达“立即替换”），
+再用**该版本独立的连续计数状态**评估。因此无论规则修改与批次提交/buffered 冲刷如何并发，
+每条记录序列号只会被一个版本评估，不重不漏：
+
+- `effective_from_seq` 可在修改时显式指定；省略时默认取设备当前 `next_expected`（即“从此刻起”）。
+- 生效序号只允许**单调不回退**（不得小于现有最新版本的生效序号），否则返回 `422`；
+  允许与最新版本相同，表示从该序号起以新版本为准（同序号新版本号决胜）。
+- 切换出的新版本从**冷状态**（streak=0）开始；旧版本的连续计数既不被继承也不被清零。
+- 历史版本、各版本状态以及已经生成的告警（连同 field/op/threshold/consecutive 快照与
+  `rule_version`）**永不改写**；即使之后再次修改规则，旧告警仍指向产生它的版本。
+- 生效序号高于当前记录的版本不评估这些记录（可“预置”未来生效的配置）；规则创建前的
+  历史记录同样不回溯。
+- 声明断档会重置该设备所有规则所有版本的连续计数。
+
 **告警确认工作流**：每条告警生成时状态为 `open`，并带 `acknowledged_by`/`acknowledged_at`
 两个空字段。运维方可按告警 ID 调用确认接口，将其置为 `acknowledged` 并记录**确认人标识**
 与**服务端确认时间**。确认接口**幂等**：重复确认（无论是否换人）都返回当前记录，
@@ -78,8 +103,11 @@ SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过�
 **并发一致性**：每请求一个 SQLite 连接（WAL 模式 + `busy_timeout`），所有状态变更包裹在
 `BEGIN IMMEDIATE` 写事务中，写操作在数据库层面串行化；同步端点运行在线程池中，
 配合每序列号幂等，并发/重试/乱序下状态保持一致。告警状态与产生它的记录状态变更
-在同一事务内提交。告警确认使用“仅当 `status = 'open'` 才更新”的条件 UPDATE，
-并发确认在数据库层串行化，恰好一个请求完成首次确认，其余请求读到一致的已确认记录。
+在同一事务内提交。**规则生效版本的选择、每版本状态推进与告警插入同样在该记录提交
+（直接提交或 buffered→committed 冲刷）的同一事务内完成**，因此规则修改与批次并发时，
+按记录序号选择生效版本是原子且唯一的。告警确认使用“仅当 `status = 'open'` 才更新”的
+条件 UPDATE，并发确认在数据库层串行化，恰好一个请求完成首次确认，其余请求读到一致的
+已确认记录。
 
 ## API 一览
 
@@ -202,7 +230,8 @@ POST /api/v1/devices/{device_id}/alert-rules
 
 `field` 为 payload 顶层数值字段名；`op` 取 `gt`（大于阈值越限）或 `lt`（小于阈值越限）；
 `consecutive` 为触发告警所需的连续越限条数 N（≥ 1）。设备不存在也可先建规则
-（设备由首个批次惰性创建），规则只评估创建之后新提交的记录。返回 `201`：
+（设备由首个批次惰性创建），规则只评估创建之后新提交的记录。返回 `201`，新规则为
+**版本 1、生效序号 0**：
 
 ```json
 {
@@ -213,9 +242,73 @@ POST /api/v1/devices/{device_id}/alert-rules
   "threshold": 30.0,
   "consecutive": 3,
   "created_at": 1758000000.12,
-  "state": {"last_seq": null, "streak": 0, "alerted": false}
+  "version": 1,
+  "effective_from_seq": 0,
+  "state": {"last_seq": null, "streak": 0, "alerted": false},
+  "versions": [
+    {"rule_id": 1, "version": 1, "field": "temp", "op": "gt",
+     "threshold": 30.0, "consecutive": 3, "effective_from_seq": 0,
+     "created_at": 1758000000.12,
+     "state": {"last_seq": null, "streak": 0, "alerted": false}}
+  ]
 }
 ```
+
+规则级字段（field/op/threshold/consecutive/state）始终镜像**最新版本**，`versions` 为
+该规则的全部历史版本（含每版本独立状态）。
+
+### 修改告警规则（追加新版本）
+
+```
+PUT /api/v1/devices/{device_id}/alert-rules/{rule_id}
+```
+
+请求体与创建规则一致，另含可选的 `effective_from_seq`（≥ 0）：
+
+```json
+{
+  "field": "temp",
+  "op": "gt",
+  "threshold": 50.0,
+  "consecutive": 2,
+  "effective_from_seq": 1000
+}
+```
+
+- 成功返回 `200`，结构与规则列表项相同：版本号 +1，新版本从此前从未评估过的冷状态开始。
+- `effective_from_seq` 省略时默认取设备当前 `next_expected`（设备尚不存在时为 0）。
+- 生效序号不得小于当前最新版本的生效序号；回退返回 `422`（错误信息给出当前下界）。
+  允许与最新版本**相同**（从该序号起以新版本为准）。
+- 规则 ID 不属于该设备（含不存在）返回 `404`；参数校验失败返回 `422`。
+- 修改是**追加**：旧版本、旧版本状态与已生成告警均保持不变。
+
+### 告警规则版本列表
+
+```
+GET /api/v1/devices/{device_id}/alert-rules/{rule_id}/versions
+```
+
+按版本号升序返回该规则的全部不可变版本，每个版本带配置快照、`effective_from_seq`、
+创建时间与该版本独立的实时状态：
+
+```json
+{
+  "device_id": "dev-001",
+  "rule_id": 1,
+  "versions": [
+    {"rule_id": 1, "version": 1, "field": "temp", "op": "gt",
+     "threshold": 30.0, "consecutive": 3, "effective_from_seq": 0,
+     "created_at": 1758000000.12,
+     "state": {"last_seq": 999, "streak": 999, "alerted": true}},
+    {"rule_id": 1, "version": 2, "field": "temp", "op": "gt",
+     "threshold": 50.0, "consecutive": 2, "effective_from_seq": 1000,
+     "created_at": 1758000100.00,
+     "state": {"last_seq": null, "streak": 0, "alerted": false}}
+  ]
+}
+```
+
+规则不属于该设备返回 `404`。
 
 ### 告警规则列表
 
@@ -223,28 +316,32 @@ POST /api/v1/devices/{device_id}/alert-rules
 GET /api/v1/devices/{device_id}/alert-rules
 ```
 
-返回该设备全部规则及实时状态：`streak`（当前连续越限条数）、`alerted`
-（当前连续区段是否已触发告警）、`last_seq`（最近参与计算的 committed 序列号）。
+返回该设备全部规则；规则级字段为最新版本快照及其实时状态，`versions` 内嵌全部历史版本：
+各版本的 `streak`（当前连续越限条数）、`alerted`（当前连续区段是否已触发告警）、
+`last_seq`（该版本最近参与计算的 committed 序列号）。
 
 ### 查询告警
 
 ```
 GET /api/v1/devices/{device_id}/alerts
 GET /api/v1/devices/{device_id}/alerts?rule_id=1
+GET /api/v1/devices/{device_id}/alerts?rule_version=2
 GET /api/v1/devices/{device_id}/alerts?status=open
-GET /api/v1/devices/{device_id}/alerts?rule_id=1&status=acknowledged
+GET /api/v1/devices/{device_id}/alerts?rule_id=1&rule_version=2&status=acknowledged
 ```
 
-`rule_id` 与 `status` 均为可选过滤，可组合使用：
+`rule_id`、`rule_version` 与 `status` 均为可选过滤，可任意组合：
 
 | 参数 | 说明 |
 |---|---|
-| `rule_id` | 仅返回该规则产生的告警 |
+| `rule_id` | 仅返回该规则（任意版本）产生的告警 |
+| `rule_version` | 仅返回由规则的**该版本**产生的告警（版本切换后便于按版本追溯） |
 | `status` | `open`（未确认）/ `acknowledged`（已确认）；不传则保留**全部历史** |
 
 每条告警记录越限区段的 `start_seq`/`end_seq`（end 为达到连续条数
-的那条记录）、触发值 `trigger_value`、规则快照（field/op/threshold/consecutive）
-以及确认工作流字段（`status`、`acknowledged_by`、`acknowledged_at`）。
+的那条记录）、触发值 `trigger_value`、产生它的 `rule_version`、规则快照
+（field/op/threshold/consecutive）以及确认工作流字段
+（`status`、`acknowledged_by`、`acknowledged_at`）。
 过滤只筛选行，响应始终保留告警的全部字段：
 
 ```json
@@ -254,6 +351,7 @@ GET /api/v1/devices/{device_id}/alerts?rule_id=1&status=acknowledged
     {
       "alert_id": 1,
       "rule_id": 1,
+      "rule_version": 1,
       "device_id": "dev-001",
       "field": "temp",
       "op": "gt",
@@ -373,14 +471,30 @@ curl localhost:8000/api/v1/devices/dev-001/alerts
 curl -X POST localhost:8000/api/v1/devices/dev-001/alerts/1/acknowledge \
   -H 'Content-Type: application/json' \
   -d '{"acknowledged_by":"ops-alice"}'
-# -> 200 {"alert_id": 1, "status": "acknowledged",
+# -> 200 {"alert_id": 1, "rule_version": 1, "status": "acknowledged",
 #         "acknowledged_by": "ops-alice", "acknowledged_at": 1758000012.8, ...}
 # 仅看待确认 / 已确认告警：
 curl 'localhost:8000/api/v1/devices/dev-001/alerts?status=open'
 curl 'localhost:8000/api/v1/devices/dev-001/alerts?status=acknowledged'
 
-# 11. 查看规则实时状态（streak/alerted）
+# 11. 查看规则实时状态（最新版本 + 内嵌历史版本）
 curl localhost:8000/api/v1/devices/dev-001/alert-rules
+
+# 12. 修改规则：追加版本 2，自 seq 1000 起改为 temp>50 连续 2 条
+curl -X PUT localhost:8000/api/v1/devices/dev-001/alert-rules/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"field":"temp","op":"gt","threshold":50,"consecutive":2,"effective_from_seq":1000}'
+# -> 200 {"rule_id": 1, "version": 2, "effective_from_seq": 1000,
+#         "state": {"last_seq": null, "streak": 0, "alerted": false},
+#         "versions": [ {版本 1 ...}, {版本 2 ...} ]}
+# 省略 effective_from_seq 时默认取当前 next_expected（从此刻起生效）
+# 生效序号回退（< 现有最新值）返回 422
+
+# 13. 查看全部版本及其独立状态；按版本筛选历史告警
+curl localhost:8000/api/v1/devices/dev-001/alert-rules/1/versions
+curl 'localhost:8000/api/v1/devices/dev-001/alerts?rule_version=1'
+curl 'localhost:8000/api/v1/devices/dev-001/alerts?rule_version=2'
+# 之后提交 seq >= 1000 的记录将由版本 2 评估；版本 1 与其产生的告警不再变化
 ```
 
 ## 项目结构
@@ -390,14 +504,15 @@ app/
   config.py   # 环境变量配置
   db.py       # SQLite 连接、建表、写事务（WAL + BEGIN IMMEDIATE）
   window.py   # 滑动窗口核心引擎（提交/暂存/断档/重放/回锚）
-  alerts.py   # 连续阈值告警引擎（规则推进/断档中断/告警生成）
+  alerts.py   # 连续阈值告警引擎（版本化规则/按 seq 选版本/断档中断/告警生成）
   cursor.py   # HMAC 签名的不透明分页游标（高水位 + 键集位置）
   models.py   # 请求/响应模型
   main.py     # FastAPI 应用、路由、后台断档扫描器
 tests/
-  test_api.py     # 乱序/幂等/断档/重放/回锚/并发一致性测试
-  test_records.py # 一致性分页：快照隔离/游标篡改/跨设备/区间变更测试
-  test_alerts.py  # 连续阈值告警：规则 CRUD/连续计数/断档中断/补录不重算测试
+  test_api.py          # 乱序/幂等/断档/重放/回锚/并发一致性测试
+  test_records.py      # 一致性分页：快照隔离/游标篡改/跨设备/区间变更测试
+  test_alerts.py       # 连续阈值告警：规则 CRUD/连续计数/断档中断/补录不重算测试
+  test_rule_versions.py # 规则版本化：版本追加/按 seq 生效/SQLite 迁移/并发切换测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
@@ -423,3 +538,12 @@ pytest tests/ -q
 历史字段、重复确认幂等且不改首次确认信息（换人也不可覆盖）、按状态筛选（可与 rule_id
 组合，非法值 422）、未知/跨设备告警 404、请求体校验、旧版 SQLite 库启动自动迁移，
 以及真实 uvicorn 服务下 16 并发确认单条告警时唯一确认人胜出、所有响应与落库状态一致。
+规则版本化：版本 1 自 seq 0 起、修改追加递增版本且新版本冷启动、省略生效序号默认取
+next_expected、生效序号回退 422（相同生效序号允许且新版本决胜）、按记录 seq 原子选择
+版本（直接提交与 buffered 冲刷均逐条按序评估）、版本切换不继承/不清空旧版本计数、
+历史版本与已生成告警不可变、版本列表与 `rule_version` 告警筛选（可与 rule_id/status
+组合）、未知/跨设备规则 404、旧版 SQLite 库（含带旧状态表的库）启动自动迁移为版本
+结构且幂等，以及真实 uvicorn 服务下：8 个同生效序号修改与单次大 buffered→committed
+冲刷竞争时尾部记录唯一归属一个版本且计数空间不重不漏、8 个不同生效序号并发修改按
+非回退规则串行成单调链且每条记录归属与最终版本表一致、两阶段并发批次与版本切换下
+按 seq 边界 100/100 划分且告警不跨边界。

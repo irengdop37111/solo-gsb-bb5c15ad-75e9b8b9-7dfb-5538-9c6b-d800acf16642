@@ -76,15 +76,64 @@ class AlertRuleStateOut(BaseModel):
     alerted: bool            # true while the current run has fired its alert
 
 
-class AlertRuleOut(BaseModel):
+class AlertRuleVersionOut(BaseModel):
+    """One immutable version of a rule and its own evaluation state."""
     rule_id: int
-    device_id: str
+    version: int
     field: str
     op: str
     threshold: float
     consecutive: int
+    effective_from_seq: int  # first committed seq governed by this version
     created_at: float
     state: AlertRuleStateOut
+
+
+class AlertRuleOut(BaseModel):
+    rule_id: int
+    device_id: str
+    # Rule-level fields mirror the *latest* version; `versions` carries the
+    # full history (configuration snapshot + per-version state).
+    field: str
+    op: str
+    threshold: float
+    consecutive: int
+    version: int
+    effective_from_seq: int
+    created_at: float
+    state: AlertRuleStateOut
+    versions: list[AlertRuleVersionOut] = []
+
+
+class AlertRuleUpdateIn(BaseModel):
+    """Body for modifying a rule: appends a new immutable version."""
+    field: str = Field(
+        min_length=1, max_length=128,
+        description="Top-level payload key holding the numeric measurement to watch",
+    )
+    op: Literal["gt", "lt"] = Field(
+        description="Violation test: field value > threshold (gt) or < threshold (lt)",
+    )
+    # Finiteness is enforced in the endpoint (a pydantic-level rejection of a
+    # NaN/Infinity literal would itself fail to serialize into a 422 body).
+    threshold: float
+    consecutive: int = Field(
+        ge=1, le=10_000,
+        description="How many consecutive committed records must violate before alerting",
+    )
+    effective_from_seq: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="First committed seq governed by the new version. Omit to "
+        "default to the device's current next_expected (from now on). Must not "
+        "be lower than any previous version's boundary.",
+    )
+
+
+class AlertRuleVersionList(BaseModel):
+    device_id: str
+    rule_id: int
+    versions: list[AlertRuleVersionOut]
 
 
 class AlertRuleList(BaseModel):
@@ -95,6 +144,9 @@ class AlertRuleList(BaseModel):
 class AlertOut(BaseModel):
     alert_id: int
     rule_id: int
+    # Version of the rule configuration that produced this alert; pinned for
+    # the row's lifetime and usable as a list filter.
+    rule_version: int
     device_id: str
     field: str
     op: str

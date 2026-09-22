@@ -24,8 +24,10 @@ Semantics
   next_expected jumps past the hole, and buffered records drain.
 
 Every first-time transition to `committed` (direct commit or buffered drain)
-feeds the device's alert rules in ascending seq order, and declaring a gap
-breaks their consecutive runs (see alerts.py).
+feeds the device's alert rules in ascending seq order; the alert engine
+selects each rule's unique effective *version* for that seq inside this same
+transaction, and declaring a gap breaks their consecutive runs (see
+alerts.py).
 
 All public methods must be called inside a write transaction (db.write_txn),
 so concurrent batches for the same device serialize through SQLite.
@@ -281,7 +283,9 @@ class WindowEngine:
                 "detected_at, updated_at) VALUES (?, ?, ?, 'open', 0, ?, ?)",
                 (device_id, dev["next_expected"], row["seq"] - 1, gap_since, now),
             )
-            # The hole will never be committed, so it breaks every alert run.
+            # The hole will never be committed, so it breaks every alert run
+            # of every rule version; records drained just below start theirs
+            # from the reset state.
             self.alerter.on_gap_declared(device_id, now)
             self.conn.execute(
                 "UPDATE devices SET next_expected = ?, gap_since = NULL, updated_at = ? "
