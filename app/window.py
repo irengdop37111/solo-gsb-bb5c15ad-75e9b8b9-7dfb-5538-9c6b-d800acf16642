@@ -281,8 +281,10 @@ class WindowEngine:
                 "detected_at, updated_at) VALUES (?, ?, ?, 'open', 0, ?, ?)",
                 (device_id, dev["next_expected"], row["seq"] - 1, gap_since, now),
             )
-            # The hole will never be committed, so it breaks every alert run.
-            self.alerter.on_gap_declared(device_id, now)
+            # The hole will never be committed, so it breaks every alert run
+            # that still has records in flight (the version effective at the
+            # new frontier and any later scheduled version).
+            self.alerter.on_gap_declared(device_id, row["seq"], now)
             self.conn.execute(
                 "UPDATE devices SET next_expected = ?, gap_since = NULL, updated_at = ? "
                 "WHERE device_id = ?",

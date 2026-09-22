@@ -17,7 +17,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 
-from .alerts import AlertEngine
+from .alerts import AlertEngine, EffectiveSeqConflict, RuleNotFound
 from .config import Settings
 from .cursor import Cursor, CursorError, decode_cursor, encode_cursor
 from .db import connect, init_db, write_txn
@@ -27,7 +27,9 @@ from .models import (
     AlertOut,
     AlertRuleIn,
     AlertRuleList,
+    AlertRuleModifyIn,
     AlertRuleOut,
+    AlertVersionList,
     BatchIn,
     BatchResponse,
     RecordOut,
@@ -66,11 +68,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="Device Telemetry Ingest API",
-        version="1.0.0",
+        version="1.1.0",
         description="Local telemetry receiver with per-device sliding-window "
         "ordering, idempotent dedup, gap (断档) detection and replay, "
-        "consecutive-threshold alerting on committed records, and an "
-        "idempotent alert acknowledgement workflow.",
+        "consecutive-threshold alerting on committed records with versioned "
+        "alert rules, and an idempotent alert acknowledgement workflow.",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -329,6 +331,65 @@ def create_app(settings: Settings) -> FastAPI:
             device_id=device_id, rules=AlertEngine(conn).list_rules(device_id)
         )
 
+    @app.put(
+        f"{API_PREFIX}/devices/{{device_id}}/alert-rules/{{rule_id}}",
+        response_model=AlertRuleOut,
+    )
+    def modify_alert_rule(
+        device_id: str,
+        rule_id: int,
+        rule: AlertRuleModifyIn,
+        conn=Depends(get_conn),
+    ):
+        """Append a new, immutable parameter version to an alert rule series.
+
+        The new version is assigned the next increasing ``version_no`` and
+        starts evaluating at ``effective_seq`` (or the device's next_expected
+        when omitted). Historical versions and every alert already generated
+        stay untouched. A same-seq or non-monotonic effective_seq is rejected
+        with 409; an unknown or foreign rule id is a 404.
+        """
+        if not math.isfinite(rule.threshold):
+            raise HTTPException(status_code=422, detail="threshold must be a finite number")
+        with write_txn(conn):
+            try:
+                return AlertEngine(conn).modify_rule(
+                    device_id, rule_id, rule.field, rule.op, rule.threshold,
+                    rule.consecutive, rule.effective_seq,
+                )
+            except RuleNotFound:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"alert rule {rule_id} not found for {device_id}",
+                )
+            except EffectiveSeqConflict:
+                raise HTTPException(
+                    status_code=409,
+                    detail="effective_seq must be unique per rule, strictly "
+                    "greater than the previous version's and not before the "
+                    "device's next_expected commit frontier",
+                )
+
+    @app.get(
+        f"{API_PREFIX}/devices/{{device_id}}/alert-rules/{{rule_id}}/versions",
+        response_model=AlertVersionList,
+    )
+    def list_alert_rule_versions(device_id: str, rule_id: int, conn=Depends(get_conn)):
+        """List every historical version of a rule, oldest first.
+
+        Each version carries its own frozen evaluation state (last_seq /
+        streak / alerted), so superseded versions remain inspectable forever.
+        """
+        versions = AlertEngine(conn).list_versions(device_id, rule_id)
+        if versions is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"alert rule {rule_id} not found for {device_id}",
+            )
+        return AlertVersionList(
+            device_id=device_id, rule_id=rule_id, versions=versions
+        )
+
     @app.get(f"{API_PREFIX}/devices/{{device_id}}/alerts", response_model=AlertList)
     def list_alerts(
         device_id: str,
@@ -338,11 +399,26 @@ def create_app(settings: Settings) -> FastAPI:
             pattern="^(open|acknowledged)$",
             description="Filter by acknowledgement state; omit to keep the full history.",
         ),
+        version_no: Optional[int] = Query(
+            default=None, ge=1,
+            description="Filter by a rule's version number; requires rule_id.",
+        ),
+        rule_version_id: Optional[int] = Query(
+            default=None, ge=1,
+            description="Filter by the globally unique rule version id.",
+        ),
         conn=Depends(get_conn),
     ):
+        if version_no is not None and rule_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="version_no filter requires the rule_id parameter",
+            )
         return AlertList(
             device_id=device_id,
-            alerts=AlertEngine(conn).list_alerts(device_id, rule_id, status),
+            alerts=AlertEngine(conn).list_alerts(
+                device_id, rule_id, status, version_no, rule_version_id
+            ),
         )
 
     @app.post(
